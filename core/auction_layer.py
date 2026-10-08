@@ -4,9 +4,25 @@ integration: stale claims from robots believed to have failed are cleared,
 freeing up their claimed tasks for other robots to bid on again.
 """
 
+import os
+from pathlib import Path
 import numpy as np
 import torch
 from policy_network import CapabilityConditionedPolicy
+
+
+def _resolve_model_path(path: str) -> str:
+    if os.path.exists(path):
+        return path
+    # Check core/ folder
+    core_candidate = Path(__file__).resolve().parent / path
+    if core_candidate.exists():
+        return str(core_candidate)
+    # Check models_and_data/ folder
+    models_candidate = Path(__file__).resolve().parent.parent / "models_and_data" / path
+    if models_candidate.exists():
+        return str(models_candidate)
+    return path
 
 
 class DecentralizedAuctionLayer:
@@ -17,7 +33,8 @@ class DecentralizedAuctionLayer:
         self.n_robots = hetero_env.unwrapped.n_agents
 
         self.bid_model = CapabilityConditionedPolicy(obs_dim=80)
-        self.bid_model.load_state_dict(torch.load(bid_model_path))
+        resolved_path = _resolve_model_path(bid_model_path)
+        self.bid_model.load_state_dict(torch.load(resolved_path, map_location="cpu"))
         self.bid_model.eval()
 
         self.belief = [dict() for _ in range(self.n_robots)]

@@ -14,8 +14,31 @@ the communication/reallocation mechanism, versus the system just doing
 fine on its own regardless.
 """
 
+import os
+import sys
+from pathlib import Path
+
+# Ensure core and project root are in sys.path
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+_CORE_DIR = _ROOT_DIR / "core"
+for _p in [str(_CORE_DIR), str(_ROOT_DIR)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import torch
 from policy_network import CapabilityConditionedPolicy
+
+
+def _resolve_model_path(path: str) -> str:
+    if os.path.exists(path):
+        return path
+    core_candidate = _CORE_DIR / path
+    if core_candidate.exists():
+        return str(core_candidate)
+    models_candidate = _ROOT_DIR / "models_and_data" / path
+    if models_candidate.exists():
+        return str(models_candidate)
+    return path
 
 
 class NoCommAuctionLayer:
@@ -26,7 +49,8 @@ class NoCommAuctionLayer:
         self.n_robots = hetero_env.unwrapped.n_agents
 
         self.bid_model = CapabilityConditionedPolicy(obs_dim=80)
-        self.bid_model.load_state_dict(torch.load(bid_model_path))
+        resolved_path = _resolve_model_path(bid_model_path)
+        self.bid_model.load_state_dict(torch.load(resolved_path, map_location="cpu"))
         self.bid_model.eval()
 
     def _task_id(self, shelf):

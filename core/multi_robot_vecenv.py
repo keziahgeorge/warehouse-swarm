@@ -15,7 +15,10 @@ class MultiRobotVecEnv(VecEnv):
     """
 
     def __init__(self, env_id="rware-tiny-2ag-v2", robot_types=None, seed=None):
-        base_env = gym.make(env_id)
+        # disable_env_checker suppresses the Gymnasium passive env checker warning.
+        # HeterogeneousWarehouseWrapper returns a per-robot reward list; step_wait()
+        # converts it to np.float32 correctly.
+        base_env = gym.make(env_id, disable_env_checker=True)
         self.hetero_env = HeterogeneousWarehouseWrapper(base_env, robot_types=robot_types, seed=seed)
         self.n_robots = self.hetero_env.unwrapped.n_agents
 

@@ -8,6 +8,17 @@ Reuses the same A* pathfinding from Phase 5 for movement, so the only
 difference from your main pipeline is the task-assignment logic itself.
 """
 
+import os
+import sys
+from pathlib import Path
+
+# Ensure core and project root are on sys.path
+_ROOT_DIR = Path(__file__).resolve().parent.parent
+_CORE_DIR = _ROOT_DIR / "core"
+for _p in [str(_CORE_DIR), str(_ROOT_DIR)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import numpy as np
 from multi_robot_vecenv import MultiRobotVecEnv
 from pathfinding import GridPathfinder
