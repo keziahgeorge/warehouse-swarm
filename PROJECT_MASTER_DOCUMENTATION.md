@@ -125,7 +125,7 @@ In 2012, Amazon acquired Kiva Systems for $775 million, which evolved into **Ama
 | **Path Planning** | Central Time-Space Reservation / Conflict-Based Search (CBS). | Local collision avoidance or reactive bug algorithms. | Decentralized A* grid search with deterministic ID priority tie-breaking. |
 | **Fleet Composition** | Heterogeneous hardware: Pegasus (tote sortation), Hercules (heavy pods), Proteus (free-roaming). | Homogeneous (all robots have identical speeds, payloads, and battery). | **Heterogeneous Swarm:** 3 distinct robot classes (`fast_light`, `heavy_load`, `balanced`) matched to 3 task types. |
 | **Communication Scaling** | $O(N)$ backhaul to central server; requires dedicated industrial enterprise Wi-Fi. | $O(N^2)$ peer-to-peer broadcasts; causes severe RF channel saturation as $N$ grows. | **Bounded $O((N/Z)^2) \approx O(1)$:** Communication is restricted to intra-zone peers within range $R=8$. |
-| **Fault Detection & Recovery** | Central heartbeat timeout $\to$ manual human technician dispatch with safety vest. | Naive task drop; stranded tasks remain locked indefinitely. | **Automated Liveness Monitoring:** Heartbeat matrix with timeout $\tau=3$; instant peer task reallocation. |
+| **Fault Detection & Recovery** | Central heartbeat timeout $\to$ manual human technician dispatch with safety vest. | Naive task drop; stranded tasks remain locked indefinitely. | **Automated Liveness Monitoring:** Heartbeat matrix with timeout $\tau=3$; realistic in-place cargo rescue by healthy AMR & delayed perimeter towing. |
 | **Throughput under 25% Failure** | Requires floor clearance procedure; entire grid cell often blocked. | Severe degradation or complete stall on locked tasks. | **96.5% Throughput Retention** (only 3.5% performance drop under sustained failure). |
 
 ### 2.3 Real-World Problem Alignment
@@ -683,16 +683,19 @@ During the research and implementation phases, several subtle multi-agent bugs w
   - *Dynamic Pipelining:* Trajectory checks permit robots to follow directly behind peers vacating their cells.
   - *Distinct Task Distribution:* `ZoneAuctionLayer` distributes available tasks across all active robots in a zone rather than collapsing multiple robots onto the same single shelf, eliminating redundant idle robots.
 
-### 7. Fault Recovery: Task Handoff, Shelf Detachment & Corridor Towing
-- **Symptom:** When a robot failed while carrying or pursuing a task, the robot remained stuck in the aisle, the task was never handed off, and downstream deliveries stalled permanently.
-- **Root Cause:**
-  1. *Attached Shelf Lock:* If a robot failed while carrying a shelf (`agent.carrying_shelf`), `shelf in carried` remained permanently true, blacklisting the task from all future auctions.
-  2. *Corridor Blockade:* An incapacitated robot sitting at $(x, y)$ in a 1-wide aisle became a permanent physical barrier in RWARE's collision engine.
-  3. *Stale Claims:* The failed robot's auction claims were not proactively purged upon manual failure injection.
-- **Fix:**
-  - *Automatic Shelf Detachment & Reopening:* When a robot fails, its carried shelf is safely released (`agent.carrying_shelf = None`), placed back at its home/accessible coordinate, and re-added to the open auction queue.
-  - *Emergency Towing to Maintenance Bay:* The incapacitated robot is automatically towed out of active transit corridors to a designated perimeter parking bay (Row 0), and `ua._recalc_grid()` is called, completely clearing the aisle.
-  - *Instant Peer Handoff:* All beliefs and claims associated with the failed robot are cleared across all zones, allowing active peers to bid on and complete the abandoned task.
+### 7. Realistic Physical Fault Recovery: In-Place Cargo Rescue & Delayed Perimeter Towing
+- **Symptom:** In early prototypes, when a robot failed while carrying an inventory pod, the shelf instantly teleported back to its original rack coordinate, and the broken robot instantly teleported to the maintenance bay. In industrial fulfillment operations (e.g., Amazon Robotics), such instantaneous teleportation is physically impossible and unrepresentative of real automated facilities.
+- **Real-World Operational Reality:**
+  - An Automated Mobile Robot (AMR) carrying a 500 kg inventory pod cannot magically send the pod back to its home rack upon motor or battery failure.
+  - The broken robot remains stationary on the floor at $(x_f, y_f)$, holding the pod, blocking that localized segment.
+  - A healthy, capability-compatible peer AMR must be routed specifically to the exact breakdown location to physically relieve/collect the stranded pod.
+  - **Only after** the active peer arrives and secures the cargo can the incapacitated robot be safely cleared/towed away to the perimeter maintenance bay (Row 0).
+- **Algorithmic Protocol Implemented in `core/hierarchical_coordinator.py`:**
+  1. *Stationary Breakdown with Stranded Task Registration:* When `inject_failure(robot_id)` fires, if the robot is carrying a shelf (`agent.carrying_shelf is not None`), the shelf is **not** moved and the robot is **not** towed. The incident is registered in `self.stranded_tasks[robot_id] = {'shelf': shelf, 'pos': (x_f, y_f), 'assigned_robot': None}`. The broken robot halts via `NOOP` overrides at $(x_f, y_f)$.
+  2. *Autonomous Capability-Matched Rescue Dispatch:* In `_process_stranded_tasks()`, the coordinator evaluates healthy, unladen AMRs whose robot class matches the task capability requirement (`ACCEPTABLE_ROBOTS[task_type]`) and computes Manhattan distances to $(x_f, y_f)$. The optimal recovery AMR $R$ is assigned and dynamically routed (`global_pursue[R] = True`, `global_nearest_tasks[R] = pos`).
+  3. *In-Place Cargo Handoff:* When recovery robot $R$ arrives adjacent to the broken AMR ($\text{dist} \le 1$), the physical load is transferred in-place (`rec_agent.carrying_shelf = shelf`, `failed_agent.carrying_shelf = None`, `shelf.x, shelf.y = rec_agent.x, rec_agent.y`). Robot $R$ immediately transitions into active delivery transit toward the pack station.
+  4. *Delayed Towing to Perimeter Bay:* **Only after** the cargo has been successfully transferred is the incapacitated AMR towed to the perimeter maintenance bay `(robot_id % grid_width, 0)`, followed immediately by `self.env.unwrapped._recalc_grid()` to synchronize RWARE's spatial collision matrix and fully clear the transit aisle.
+  *(Note: If an AMR fails while completely empty with no cargo, it is towed immediately to Row 0 as no task is stranded).*
 
 ---
 
@@ -789,6 +792,8 @@ python experiments/train_bid_head.py
 
 ---
 
+
+---
 
 ---
 
@@ -2574,6 +2579,7 @@ class HierarchicalCoordinator:
         ]
 
         self.pathfinder = GridPathfinder(hetero_env)
+        self.stranded_tasks: dict = {}
 
         # --- Stats ---
         self.cross_zone_handoffs = 0
@@ -2648,6 +2654,7 @@ class HierarchicalCoordinator:
         """Call after RWARE resets the world (also auto-detected in step)."""
         self._task_zone.clear()
         self._task_tried_zones.clear()
+        self.stranded_tasks.clear()
         for auction in self.auctions:
             auction.reset_episode()
         self.pathfinder.reset_episode()
@@ -2655,6 +2662,61 @@ class HierarchicalCoordinator:
     # ------------------------------------------------------------------
     # Main step
     # ------------------------------------------------------------------
+
+    def _process_stranded_tasks(self, global_pursue, global_nearest_tasks):
+        """Dispatches active AMR to physically collect load from broken AMR before towing."""
+        ua = self.env.unwrapped
+        agents = ua.agents
+        failed_flags = self.fault_layers[0].actual_failed
+
+        for f_id, data in list(self.stranded_tasks.items()):
+            shelf = data['shelf']
+            pos = data['pos']
+            rec_id = data['assigned_robot']
+
+            # 1. Check if assigned recovery robot has arrived adjacent to failed robot
+            if rec_id is not None and not failed_flags[rec_id]:
+                rec_agent = agents[rec_id]
+                dist = abs(int(rec_agent.x) - pos[0]) + abs(int(rec_agent.y) - pos[1])
+                if dist <= 1 and rec_agent.carrying_shelf is None:
+                    # Physically transfer load to recovery robot
+                    rec_agent.carrying_shelf = shelf
+                    agents[f_id].carrying_shelf = None
+                    shelf.x, shelf.y = rec_agent.x, rec_agent.y
+                    print(f"\n>>> [FaultRecovery] HANDOFF COMPLETE: Robot {rec_id} arrived at {pos} and COLLECTED shelf {shelf.id} from failed Robot {f_id}! <<<")
+
+                    # ONLY NOW can the incapacitated robot be towed away to perimeter maintenance bay
+                    agents[f_id].x = f_id % ua.grid_size[1]
+                    agents[f_id].y = 0
+                    ua._recalc_grid()
+                    print(f">>> [FaultRecovery] Failed Robot {f_id} is NOW towed to maintenance bay ({agents[f_id].x}, {agents[f_id].y})! <<<\n")
+
+                    del self.stranded_tasks[f_id]
+                    continue
+
+            # 2. Assign best available eligible robot if not currently assigned
+            if rec_id is None or failed_flags[rec_id] or agents[rec_id].carrying_shelf is not None:
+                task_type = getattr(self.env, "shelf_task_type", {}).get(shelf, 2)
+                acceptable = getattr(self.env, "ACCEPTABLE_ROBOTS", {task_type: [0, 1, 2]}).get(task_type, [0, 1, 2])
+                best_robot = None
+                best_d = float('inf')
+                for r in range(self.n_robots):
+                    if not failed_flags[r] and agents[r].carrying_shelf is None:
+                        robot_type = self.env.robot_types[r] if hasattr(self.env, "robot_types") else 2
+                        if robot_type in acceptable:
+                            d = abs(int(agents[r].x) - pos[0]) + abs(int(agents[r].y) - pos[1])
+                            if d < best_d:
+                                best_d = d
+                                best_robot = r
+                if best_robot is not None:
+                    data['assigned_robot'] = best_robot
+                    print(f"[FaultRecovery] Recovery Robot {best_robot} dispatched to collect stranded shelf {shelf.id} from Robot {f_id} at {pos}")
+
+            # 3. Direct assigned recovery robot to failed robot's location
+            if data['assigned_robot'] is not None:
+                r = data['assigned_robot']
+                global_pursue[r] = True
+                global_nearest_tasks[r] = pos
 
     def step(self, obs_batch):
         # auto-detect a RWARE reset (step counter went backwards)
@@ -2686,6 +2748,8 @@ class HierarchicalCoordinator:
                 global_pursue[i] = pursue_z[i]
                 global_nearest_tasks[i] = nearest_z[i]
 
+        self._process_stranded_tasks(global_pursue, global_nearest_tasks)
+
         self._handle_bid_timeouts()
         self._clean_completed_tasks()
 
@@ -2703,38 +2767,34 @@ class HierarchicalCoordinator:
         ua = self.env.unwrapped
         agent = ua.agents[robot_id]
 
-        # 1. Release shelf if carried so it can be completed by peers
-        shelf = agent.carrying_shelf
-        if shelf is not None:
-            agent.carrying_shelf = None
-            shelf_key = self.pathfinder._shelf_key(shelf)
-            home = self.pathfinder.shelf_home.get(shelf_key)
-            if home is not None:
-                shelf.x, shelf.y = home
-            else:
-                shelf.x, shelf.y = int(agent.x), int(agent.y)
-            # Reopen the task for routing & re-auctioning
-            tid = (int(shelf.x), int(shelf.y))
-            if tid in self._task_zone:
-                del self._task_zone[tid]
-            if tid in self._task_tried_zones:
-                del self._task_tried_zones[tid]
-            print(f"[FaultRecovery] Shelf {shelf.id} released from failed Robot {robot_id} -> placed at ({shelf.x}, {shelf.y}) for handoff")
-
-        # 2. Tow the incapacitated robot to the perimeter maintenance bay (Row 0)
-        # to clear narrow traffic corridors and delivery goals
-        orig_pos = (int(agent.x), int(agent.y))
-        agent.x = robot_id % ua.grid_size[1]
-        agent.y = 0
-        ua._recalc_grid()
-        print(f"[FaultRecovery] Robot {robot_id} failed at {orig_pos} -> Towed to maintenance bay ({agent.x}, {agent.y}) to clear traffic aisle")
-
-        # 3. Mark failure in all fault layers
+        # 1. Mark failure in all fault layers
         self.fault_layers[0].inject_failure(robot_id)          # prints once
         for z in range(1, self.n_zones):
             self.fault_layers[z].actual_failed[robot_id] = True  # silent
 
-        # 4. Immediate task handoff: clear all beliefs and claims held by robot_id
+        # 2. Check if robot is carrying a shelf (Realistic Physical Fault Recovery)
+        shelf = agent.carrying_shelf
+        if shelf is not None:
+            # Robot stays at its current location holding the load.
+            # It will NOT teleport to the perimeter bay, and shelf is NOT teleported home.
+            # Another AMR must be dispatched to collect the load in-place.
+            pos = (int(agent.x), int(agent.y))
+            self.stranded_tasks[robot_id] = {
+                'shelf': shelf,
+                'pos': pos,
+                'assigned_robot': None,
+            }
+            print(f"[FaultRecovery] Robot {robot_id} FAILED at {pos} holding shelf {shelf.id}! "
+                  f"Incapacitated robot remains in place holding load until recovery robot arrives.")
+        else:
+            # Unladen robot: safely towed immediately to perimeter maintenance bay
+            orig_pos = (int(agent.x), int(agent.y))
+            agent.x = robot_id % ua.grid_size[1]
+            agent.y = 0
+            ua._recalc_grid()
+            print(f"[FaultRecovery] Empty Robot {robot_id} failed at {orig_pos} -> Towed to maintenance bay ({agent.x}, {agent.y}) to clear traffic aisle")
+
+        # 3. Clear all beliefs and claims held by robot_id
         for auction in self.auctions:
             auction.known_claims[robot_id].clear()
             for r in range(self.n_robots):
@@ -4137,6 +4197,9 @@ class WarehouseGUI:
         self.lbl_carry = tk.Label(stats_box, text="Carrying a shelf: 0", font=("Segoe UI", 10), bg="#2b3035", fg="#ced4da", anchor="w")
         self.lbl_carry.pack(fill=tk.X)
 
+        self.lbl_stranded = tk.Label(stats_box, text="Stranded Tasks (Awaiting Rescue): 0", font=("Segoe UI", 10), bg="#2b3035", fg="#ff8787", anchor="w")
+        self.lbl_stranded.pack(fill=tk.X)
+
         # Fault injection
         fault_box = tk.LabelFrame(
             sidebar, text=" Fault Injection (Test Resilience) ",
@@ -4244,10 +4307,12 @@ class WarehouseGUI:
             is_failed = failed_flags[i]
 
             robot_col = self.FAILED_ROBOT_COLOR if is_failed else self.ROBOT_COLORS[r_type]
+            outline_col = "#ff6b6b" if (is_failed and agent.carrying_shelf is not None) else "#212529"
+            outline_w = 3 if (is_failed and agent.carrying_shelf is not None) else 2
 
             self.canvas.create_oval(
                 rx * c + 3, ry * c + 3, (rx + 1) * c - 3, (ry + 1) * c - 3,
-                fill=robot_col, outline="#212529", width=2, tags="dynamic"
+                fill=robot_col, outline=outline_col, width=outline_w, tags="dynamic"
             )
 
             if agent.carrying_shelf is not None:
@@ -4273,6 +4338,7 @@ class WarehouseGUI:
             if a == 0 and not failed_flags[i]
         )
         n_alive = sum(1 for f in failed_flags if not f)
+        n_stranded = len(self.coordinator.stranded_tasks)
 
         self.lbl_step.config(text=f"Step: {self.step_count:,}")
         self.lbl_episode.config(text=f"Episode: {self.episode} (step {self.episode_steps})")
@@ -4284,6 +4350,7 @@ class WarehouseGUI:
         )
         self.lbl_idle.config(text=f"Idle robots (NOOP): {n_idle}/{n_alive}")
         self.lbl_carry.config(text=f"Carrying a shelf: {n_carrying}")
+        self.lbl_stranded.config(text=f"Stranded Tasks (Awaiting Rescue): {n_stranded}")
 
     def step_simulation(self):
         try:

@@ -190,6 +190,9 @@ class WarehouseGUI:
         self.lbl_carry = tk.Label(stats_box, text="Carrying a shelf: 0", font=("Segoe UI", 10), bg="#2b3035", fg="#ced4da", anchor="w")
         self.lbl_carry.pack(fill=tk.X)
 
+        self.lbl_stranded = tk.Label(stats_box, text="Stranded Tasks (Awaiting Rescue): 0", font=("Segoe UI", 10), bg="#2b3035", fg="#ff8787", anchor="w")
+        self.lbl_stranded.pack(fill=tk.X)
+
         # Fault injection
         fault_box = tk.LabelFrame(
             sidebar, text=" Fault Injection (Test Resilience) ",
@@ -297,10 +300,12 @@ class WarehouseGUI:
             is_failed = failed_flags[i]
 
             robot_col = self.FAILED_ROBOT_COLOR if is_failed else self.ROBOT_COLORS[r_type]
+            outline_col = "#ff6b6b" if (is_failed and agent.carrying_shelf is not None) else "#212529"
+            outline_w = 3 if (is_failed and agent.carrying_shelf is not None) else 2
 
             self.canvas.create_oval(
                 rx * c + 3, ry * c + 3, (rx + 1) * c - 3, (ry + 1) * c - 3,
-                fill=robot_col, outline="#212529", width=2, tags="dynamic"
+                fill=robot_col, outline=outline_col, width=outline_w, tags="dynamic"
             )
 
             if agent.carrying_shelf is not None:
@@ -326,6 +331,7 @@ class WarehouseGUI:
             if a == 0 and not failed_flags[i]
         )
         n_alive = sum(1 for f in failed_flags if not f)
+        n_stranded = len(self.coordinator.stranded_tasks)
 
         self.lbl_step.config(text=f"Step: {self.step_count:,}")
         self.lbl_episode.config(text=f"Episode: {self.episode} (step {self.episode_steps})")
@@ -337,6 +343,7 @@ class WarehouseGUI:
         )
         self.lbl_idle.config(text=f"Idle robots (NOOP): {n_idle}/{n_alive}")
         self.lbl_carry.config(text=f"Carrying a shelf: {n_carrying}")
+        self.lbl_stranded.config(text=f"Stranded Tasks (Awaiting Rescue): {n_stranded}")
 
     def step_simulation(self):
         try:

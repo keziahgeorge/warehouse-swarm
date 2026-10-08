@@ -53,6 +53,7 @@ class HierarchicalCoordinator:
         ]
 
         self.pathfinder = GridPathfinder(hetero_env)
+        self.stranded_tasks: dict = {}
 
         # --- Stats ---
         self.cross_zone_handoffs = 0
@@ -127,6 +128,7 @@ class HierarchicalCoordinator:
         """Call after RWARE resets the world (also auto-detected in step)."""
         self._task_zone.clear()
         self._task_tried_zones.clear()
+        self.stranded_tasks.clear()
         for auction in self.auctions:
             auction.reset_episode()
         self.pathfinder.reset_episode()
@@ -134,6 +136,61 @@ class HierarchicalCoordinator:
     # ------------------------------------------------------------------
     # Main step
     # ------------------------------------------------------------------
+
+    def _process_stranded_tasks(self, global_pursue, global_nearest_tasks):
+        """Dispatches active AMR to physically collect load from broken AMR before towing."""
+        ua = self.env.unwrapped
+        agents = ua.agents
+        failed_flags = self.fault_layers[0].actual_failed
+
+        for f_id, data in list(self.stranded_tasks.items()):
+            shelf = data['shelf']
+            pos = data['pos']
+            rec_id = data['assigned_robot']
+
+            # 1. Check if assigned recovery robot has arrived adjacent to failed robot
+            if rec_id is not None and not failed_flags[rec_id]:
+                rec_agent = agents[rec_id]
+                dist = abs(int(rec_agent.x) - pos[0]) + abs(int(rec_agent.y) - pos[1])
+                if dist <= 1 and rec_agent.carrying_shelf is None:
+                    # Physically transfer load to recovery robot
+                    rec_agent.carrying_shelf = shelf
+                    agents[f_id].carrying_shelf = None
+                    shelf.x, shelf.y = rec_agent.x, rec_agent.y
+                    print(f"\n>>> [FaultRecovery] HANDOFF COMPLETE: Robot {rec_id} arrived at {pos} and COLLECTED shelf {shelf.id} from failed Robot {f_id}! <<<")
+
+                    # ONLY NOW can the incapacitated robot be towed away to perimeter maintenance bay
+                    agents[f_id].x = f_id % ua.grid_size[1]
+                    agents[f_id].y = 0
+                    ua._recalc_grid()
+                    print(f">>> [FaultRecovery] Failed Robot {f_id} is NOW towed to maintenance bay ({agents[f_id].x}, {agents[f_id].y})! <<<\n")
+
+                    del self.stranded_tasks[f_id]
+                    continue
+
+            # 2. Assign best available eligible robot if not currently assigned
+            if rec_id is None or failed_flags[rec_id] or agents[rec_id].carrying_shelf is not None:
+                task_type = getattr(self.env, "shelf_task_type", {}).get(shelf, 2)
+                acceptable = getattr(self.env, "ACCEPTABLE_ROBOTS", {task_type: [0, 1, 2]}).get(task_type, [0, 1, 2])
+                best_robot = None
+                best_d = float('inf')
+                for r in range(self.n_robots):
+                    if not failed_flags[r] and agents[r].carrying_shelf is None:
+                        robot_type = self.env.robot_types[r] if hasattr(self.env, "robot_types") else 2
+                        if robot_type in acceptable:
+                            d = abs(int(agents[r].x) - pos[0]) + abs(int(agents[r].y) - pos[1])
+                            if d < best_d:
+                                best_d = d
+                                best_robot = r
+                if best_robot is not None:
+                    data['assigned_robot'] = best_robot
+                    print(f"[FaultRecovery] Recovery Robot {best_robot} dispatched to collect stranded shelf {shelf.id} from Robot {f_id} at {pos}")
+
+            # 3. Direct assigned recovery robot to failed robot's location
+            if data['assigned_robot'] is not None:
+                r = data['assigned_robot']
+                global_pursue[r] = True
+                global_nearest_tasks[r] = pos
 
     def step(self, obs_batch):
         # auto-detect a RWARE reset (step counter went backwards)
@@ -165,6 +222,8 @@ class HierarchicalCoordinator:
                 global_pursue[i] = pursue_z[i]
                 global_nearest_tasks[i] = nearest_z[i]
 
+        self._process_stranded_tasks(global_pursue, global_nearest_tasks)
+
         self._handle_bid_timeouts()
         self._clean_completed_tasks()
 
@@ -182,38 +241,34 @@ class HierarchicalCoordinator:
         ua = self.env.unwrapped
         agent = ua.agents[robot_id]
 
-        # 1. Release shelf if carried so it can be completed by peers
-        shelf = agent.carrying_shelf
-        if shelf is not None:
-            agent.carrying_shelf = None
-            shelf_key = self.pathfinder._shelf_key(shelf)
-            home = self.pathfinder.shelf_home.get(shelf_key)
-            if home is not None:
-                shelf.x, shelf.y = home
-            else:
-                shelf.x, shelf.y = int(agent.x), int(agent.y)
-            # Reopen the task for routing & re-auctioning
-            tid = (int(shelf.x), int(shelf.y))
-            if tid in self._task_zone:
-                del self._task_zone[tid]
-            if tid in self._task_tried_zones:
-                del self._task_tried_zones[tid]
-            print(f"[FaultRecovery] Shelf {shelf.id} released from failed Robot {robot_id} -> placed at ({shelf.x}, {shelf.y}) for handoff")
-
-        # 2. Tow the incapacitated robot to the perimeter maintenance bay (Row 0)
-        # to clear narrow traffic corridors and delivery goals
-        orig_pos = (int(agent.x), int(agent.y))
-        agent.x = robot_id % ua.grid_size[1]
-        agent.y = 0
-        ua._recalc_grid()
-        print(f"[FaultRecovery] Robot {robot_id} failed at {orig_pos} -> Towed to maintenance bay ({agent.x}, {agent.y}) to clear traffic aisle")
-
-        # 3. Mark failure in all fault layers
+        # 1. Mark failure in all fault layers
         self.fault_layers[0].inject_failure(robot_id)          # prints once
         for z in range(1, self.n_zones):
             self.fault_layers[z].actual_failed[robot_id] = True  # silent
 
-        # 4. Immediate task handoff: clear all beliefs and claims held by robot_id
+        # 2. Check if robot is carrying a shelf (Realistic Physical Fault Recovery)
+        shelf = agent.carrying_shelf
+        if shelf is not None:
+            # Robot stays at its current location holding the load.
+            # It will NOT teleport to the perimeter bay, and shelf is NOT teleported home.
+            # Another AMR must be dispatched to collect the load in-place.
+            pos = (int(agent.x), int(agent.y))
+            self.stranded_tasks[robot_id] = {
+                'shelf': shelf,
+                'pos': pos,
+                'assigned_robot': None,
+            }
+            print(f"[FaultRecovery] Robot {robot_id} FAILED at {pos} holding shelf {shelf.id}! "
+                  f"Incapacitated robot remains in place holding load until recovery robot arrives.")
+        else:
+            # Unladen robot: safely towed immediately to perimeter maintenance bay
+            orig_pos = (int(agent.x), int(agent.y))
+            agent.x = robot_id % ua.grid_size[1]
+            agent.y = 0
+            ua._recalc_grid()
+            print(f"[FaultRecovery] Empty Robot {robot_id} failed at {orig_pos} -> Towed to maintenance bay ({agent.x}, {agent.y}) to clear traffic aisle")
+
+        # 3. Clear all beliefs and claims held by robot_id
         for auction in self.auctions:
             auction.known_claims[robot_id].clear()
             for r in range(self.n_robots):
